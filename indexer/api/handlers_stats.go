@@ -89,7 +89,18 @@ func (h *APIHandler) HandleGetEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	events, err := h.getRecentEventsFn(r.Context(), limit)
+	// Optional issuer filter restricts the feed to events on that account's own
+	// invoices, which is what the SME dashboard needs (issue #1115). An empty
+	// value keeps the protocol-wide behaviour every other consumer relies on.
+	issuer := r.URL.Query().Get("issuer")
+	if issuer != "" {
+		if _, err := keypair.Parse(issuer); err != nil {
+			http.Error(w, "invalid issuer parameter: must be a Stellar account address", http.StatusBadRequest)
+			return
+		}
+	}
+
+	events, err := h.getRecentEventsFn(r.Context(), limit, issuer)
 	if err != nil {
 		// The raw DB error can disclose table/column names; log it and return
 		// a generic message (issue #921).
@@ -102,6 +113,41 @@ func (h *APIHandler) HandleGetEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, events)
+}
+
+// GET /pool/snapshots
+func (h *APIHandler) HandleGetPoolSnapshots(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 && parsed <= 500 {
+			limit = parsed
+		}
+	}
+
+	history, err := h.getPoolSnapshotsFn(r.Context(), limit)
+	if err != nil {
+		internalError(w, r, "failed to retrieve pool snapshots", err)
+		return
+	}
+
+	// Response shape matches apps/web/types/index.ts PoolSnapshot:
+	// { timestamp, utilizationRateBps, totalYieldDistributed }
+	type poolSnapshot struct {
+		Timestamp             int64  `json:"timestamp"`
+		UtilizationRateBps    int    `json:"utilizationRateBps"`
+		TotalYieldDistributed string `json:"totalYieldDistributed"`
+	}
+
+	snapshots := make([]poolSnapshot, 0, len(history))
+	for _, h := range history {
+		snapshots = append(snapshots, poolSnapshot{
+			Timestamp:             h.RecordedAt,
+			UtilizationRateBps:    h.UtilizationRateBps,
+			TotalYieldDistributed: h.TotalYieldDistributed,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, snapshots)
 }
 
 // GET /pool/position/{address}

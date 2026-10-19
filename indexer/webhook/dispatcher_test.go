@@ -312,6 +312,9 @@ func TestBuildEnvelopeEventIDFallback(t *testing.T) {
 	if first.EventID == "" {
 		t.Fatal("event_id empty when data has no event_id")
 	}
+	// time.Now().UnixNano() can collide on platforms with coarse clock
+	// resolution (notably Windows); yield before the second build.
+	time.Sleep(2 * time.Millisecond)
 	second, err := BuildEnvelope("fund_invoice", data)
 	if err != nil {
 		t.Fatalf("BuildEnvelope: %v", err)
@@ -343,8 +346,8 @@ func TestDispatchQueuesPopulatedEnvelope(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		if db.Pool != nil {
-			db.Pool.Exec(ctx, "DELETE FROM webhook_deliveries WHERE subscription_id = $1", sub.ID)
-			db.Pool.Exec(ctx, "DELETE FROM webhook_subscriptions WHERE id = $1", sub.ID)
+			_, _ = db.Pool.Exec(ctx, "DELETE FROM webhook_deliveries WHERE subscription_id = $1", sub.ID)
+			_, _ = db.Pool.Exec(ctx, "DELETE FROM webhook_subscriptions WHERE id = $1", sub.ID)
 		}
 	})
 
@@ -356,19 +359,14 @@ func TestDispatchQueuesPopulatedEnvelope(t *testing.T) {
 
 	NewDispatcher().Dispatch(ctx, "fund_invoice", data)
 
-	claimed, err := db.GetPendingDeliveries(ctx, 50)
-	if err != nil {
-		t.Fatalf("GetPendingDeliveries: %v", err)
-	}
+	// Read this test's row directly rather than claiming: a claim takes any
+	// pending rows, including rows another package's tests are claiming in the
+	// same database at the same time.
 	var payload []byte
-	for _, d := range claimed {
-		if d.EventID == eventID && d.SubscriptionID == sub.ID {
-			payload = d.Payload
-			break
-		}
-	}
-	if payload == nil {
-		t.Fatalf("Dispatch wrote no delivery row for event %s (claimed %d rows)", eventID, len(claimed))
+	if err := db.Pool.QueryRow(ctx,
+		"SELECT payload FROM webhook_deliveries WHERE event_id = $1 AND subscription_id = $2", eventID, sub.ID,
+	).Scan(&payload); err != nil {
+		t.Fatalf("Dispatch wrote no delivery row for event %s: %v", eventID, err)
 	}
 
 	var env webhooks.WebhookEnvelope
@@ -393,6 +391,50 @@ func TestDispatchQueuesPopulatedEnvelope(t *testing.T) {
 	}
 }
 
+func TestDispatchSameEventQueuesOneDeliveryPerSubscription(t *testing.T) {
+	skipIfNoDB(t)
+	ctx := context.Background()
+
+	sub := &db.WebhookSubscription{
+		TargetURL:     "https://example.invalid/webhook-916",
+		EventTypes:    []string{"fund_invoice"},
+		SigningSecret: "synthetic-secret-916",
+		Active:        true,
+	}
+	if err := db.CreateWebhookSubscription(ctx, sub); err != nil {
+		t.Fatalf("CreateWebhookSubscription: %v", err)
+	}
+	t.Cleanup(func() {
+		if db.Pool != nil {
+			_, _ = db.Pool.Exec(ctx, "DELETE FROM webhook_subscriptions WHERE id = $1", sub.ID)
+			_, _ = db.Pool.Exec(ctx, "DELETE FROM webhook_deliveries WHERE subscription_id = $1", sub.ID)
+		}
+	})
+
+	eventID := fmt.Sprintf("dispatch-916-%d", time.Now().UnixNano())
+	data := invoiceDispatchData("fund_invoice")
+	data["event_id"] = eventID
+
+	dispatcher := NewDispatcher()
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := dispatcher.EnqueueDeliveries(ctx, db.Pool, "fund_invoice", data); err != nil {
+			t.Fatalf("EnqueueDeliveries attempt %d: %v", attempt+1, err)
+		}
+	}
+
+	var count int
+	if err := db.Pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM webhook_deliveries
+		WHERE subscription_id = $1 AND event_id = $2
+	`, sub.ID, eventID).Scan(&count); err != nil {
+		t.Fatalf("count webhook deliveries: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("delivery count for subscription %s and event %s: got %d, want 1", sub.ID, eventID, count)
+	}
+}
+
 // TestDispatchWithoutSubscriptionsQueuesNothing keeps Dispatch's early return
 // honest: no rows (and no wasted envelope builds) for untracked events.
 func TestDispatchWithoutSubscriptionsQueuesNothing(t *testing.T) {
@@ -405,13 +447,63 @@ func TestDispatchWithoutSubscriptionsQueuesNothing(t *testing.T) {
 
 	NewDispatcher().Dispatch(ctx, "fund_invoice", data)
 
-	claimed, err := db.GetPendingDeliveries(ctx, 200)
-	if err != nil {
-		t.Fatalf("GetPendingDeliveries: %v", err)
+	// Count this test's rows directly rather than claiming, for the same reason
+	// as TestDispatchQueuesPopulatedEnvelope.
+	var queued int
+	if err := db.Pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM webhook_deliveries WHERE event_id = $1", eventID,
+	).Scan(&queued); err != nil {
+		t.Fatalf("count deliveries: %v", err)
 	}
-	for _, d := range claimed {
-		if d.EventID == eventID {
-			t.Fatalf("delivery %d queued for untracked event %s", d.ID, eventID)
-		}
+	if queued != 0 {
+		t.Fatalf("%d deliveries queued for untracked event %s", queued, eventID)
 	}
 }
+
+// TestMapInternalEventType covers every mapping in mapInternalEventType:
+// both the snake_case internal names the listener emits and the PascalCase
+// names the contract events use, plus the default passthrough for unknowns.
+func TestMapInternalEventType(t *testing.T) {
+	cases := []struct {
+		internal string
+		want     webhooks.EventType
+	}{
+		{"create", webhooks.EventInvoiceCreated},
+		{"InvoiceCreated", webhooks.EventInvoiceCreated},
+		{"list_for_financing", webhooks.EventInvoiceListed},
+		{"InvoiceListed", webhooks.EventInvoiceListed},
+		{"fund_invoice", webhooks.EventInvoiceFunded},
+		{"InvoiceFunded", webhooks.EventInvoiceFunded},
+		{"mark_shipped", webhooks.EventInvoiceShipped},
+		{"InvoiceShipped", webhooks.EventInvoiceShipped},
+		{"confirm_delivery", webhooks.EventInvoiceConfirmed},
+		{"DeliveryConfirmed", webhooks.EventInvoiceConfirmed},
+		{"repay", webhooks.EventInvoiceRepaid},
+		{"InvoiceRepaid", webhooks.EventInvoiceRepaid},
+		{"trigger_default", webhooks.EventInvoiceDefaulted},
+		{"InvoiceDefaulted", webhooks.EventInvoiceDefaulted},
+		{"deposit", webhooks.EventPoolDeposit},
+		{"PoolDeposit", webhooks.EventPoolDeposit},
+		{"lp_deposited", webhooks.EventPoolDeposit},
+		{"withdraw", webhooks.EventPoolWithdrawal},
+		{"PoolWithdrawal", webhooks.EventPoolWithdrawal},
+		{"lp_withdrawn", webhooks.EventPoolWithdrawal},
+		{"yield_distribution", webhooks.EventPoolYieldDistributed},
+		{"PoolYieldDistributed", webhooks.EventPoolYieldDistributed},
+		{"receive_repayment", webhooks.EventPoolYieldDistributed},
+		{"repayment_received", webhooks.EventPoolYieldDistributed},
+		{"unknown_event", webhooks.EventType("unknown_event")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.internal, func(t *testing.T) {
+			if got := mapInternalEventType(tc.internal); got != tc.want {
+				t.Errorf("mapInternalEventType(%q): got %q, want %q", tc.internal, got, tc.want)
+			}
+		})
+	}
+}
+
+// The signature-format test that used to live here (TestSign) covered the
+// copy of sign() this package carried for its never-called delivery loop.
+// Signature coverage now lives in webhooks.TestSignFormat, next to the only
+// remaining implementation of sign() (issue #879).
